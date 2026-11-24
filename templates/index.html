@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Booking Assistant</title>
+<style>
+  :root { --bg:#0b1020; --card:#161d33; --line:#2a3454; --text:#eef2ff; --muted:#9aa5c7;
+          --accent:#6366f1; --ok:#22c55e; --bad:#ef4444; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         display:flex; flex-direction:column; align-items:center; gap:1.25rem; padding:2rem 1rem; }
+  h1 { margin:0; font-size:1.4rem; }
+  .badge { display:flex; gap:.5rem; align-items:center; background:var(--card);
+           border:1px solid var(--line); padding:.4rem .9rem; border-radius:999px; font-size:.85rem; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+  .dot.ok { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .dot.busy { background:var(--accent); box-shadow:0 0 8px var(--accent); }
+  .panel { width:100%; max-width:520px; background:var(--card); border:1px solid var(--line);
+           border-radius:16px; padding:1rem; }
+  .row { display:flex; gap:.5rem; }
+  input { flex:1; padding:.8rem; border-radius:10px; border:1px solid var(--line);
+          background:var(--bg); color:var(--text); }
+  button { padding:.8rem 1.1rem; border:0; border-radius:10px; background:var(--accent);
+           color:#fff; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  a.link { color:#a5b4fc; }
+  .orb { position:relative; width:140px; height:140px; display:grid; place-items:center; }
+  .ring { position:absolute; inset:0; border-radius:50%; border:2px solid var(--accent); opacity:0;
+          transform:scale(var(--ai,1)); transition:transform .06s ease-out, opacity .15s; }
+  .orb.speaking .ring { opacity:.8; }
+  #mic { width:96px; height:96px; border-radius:50%; font-size:2rem; background:var(--card);
+         border:1px solid var(--line); transform:scale(var(--mic,1)); z-index:1; }
+  #mic.on { background:var(--bad); }
+  #log { width:100%; max-width:520px; height:300px; overflow-y:auto; background:var(--card);
+         border:1px solid var(--line); border-radius:16px; padding:1rem;
+         display:flex; flex-direction:column; gap:.6rem; }
+  .m { padding:.6rem .9rem; border-radius:12px; max-width:85%; line-height:1.45; font-size:.92rem; }
+  .you { align-self:flex-end; background:#2a3454; }
+  .ai  { align-self:flex-start; background:rgba(99,102,241,.15); border:1px solid rgba(99,102,241,.35); }
+  .sys { align-self:center; color:var(--muted); font-size:.8rem; font-style:italic; }
+  .tool { align-self:center; width:92%; font-family:ui-monospace,monospace; font-size:.8rem;
+          color:#86efac; border:1px dashed var(--ok); border-radius:8px; padding:.6rem .8rem;
+          white-space:pre-wrap; }
+  .note { max-width:520px; color:var(--muted); font-size:.8rem; text-align:center; }
+</style>
+</head>
+<body>
+  <h1>Voice Booking Assistant</h1>
+  <div class="badge"><div class="dot" id="dot"></div><span id="status">Disconnected</span></div>
+
+  <div class="panel" id="connectPanel">
+    <div class="row">
+      <input id="apiKey" type="password" placeholder="Gemini API key" autocomplete="off">
+      <button id="connectBtn">Connect</button>
+    </div>
+    <p class="note" style="margin:.75rem 0 0">
+      {% if calendar_ready %}Google Calendar: connected.
+      {% else %}Google Calendar not connected yet. <a class="link" href="/auth/login">Authorize it</a>.{% endif %}
+      Your key stays in this tab and is never sent to this server.
+    </p>
+  </div>
+
+  <div class="orb" id="orb"><div class="ring"></div><button id="mic" disabled>🎙️</button></div>
+  <div id="log"><div class="m sys">Enter your key and press Connect.</div></div>
+  <p class="note">Use headphones, otherwise the assistant may hear itself and interrupt.</p>
+
+<script>
+const API_TOKEN = "{{ api_token }}";
+const MODEL = "models/gemini-3.1-flash-live-preview";   // change if Google renames the Live model
+const VOICE = "Charon";
+const WS_BASE = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+
+const $ = id => document.getElementById(id);
+let ws, ctx, stream, proc, micAn, aiAn, raf, nextTime = 0, sources = [];
+let ready = false, calling = false, bubble = null, bubbleRole = null;
+
+function setStatus(text, cls) { $("status").textContent = text; $("dot").className = "dot " + (cls || ""); }
+function add(text, cls, chunk) {
+  const log = $("log");
+  if (chunk && bubble && bubbleRole === cls) { bubble.textContent += text; }
+  else { bubble = document.createElement("div"); bubble.className = "m " + cls; bubble.textContent = text; log.appendChild(bubble); bubbleRole = chunk ? cls : null; if (!chunk) bubble = null; }
+  log.scrollTop = log.scrollHeight;
+}
+function addTool(text) {
+  const el = document.createElement("div"); el.className = "tool"; el.textContent = text;
+  $("log").appendChild(el); $("log").scrollTop = $("log").scrollHeight; bubble = null; bubbleRole = null;
+}
+
+function localISO(d = new Date()) {
+  const p = n => String(n).padStart(2, "0");
+  const off = -d.getTimezoneOffset(), sign = off >= 0 ? "+" : "-", a = Math.abs(off);
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}${sign}${p(Math.floor(a/60))}:${p(a%60)}`;
+}
+
+const TOOLS = [{ functionDeclarations: [
+  { name: "check_availability",
+    description: "Lists busy slots on the user's calendar for one day.",
+    parameters: { type: "OBJECT", properties: {
+      date: { type: "STRING", description: "Any ISO 8601 timestamp on the day to check, with timezone offset." } },
+      required: ["date"] } },
+  { name: "book_meeting",
+    description: "Books a 30 minute meeting. Always check availability first.",
+    parameters: { type: "OBJECT", properties: {
+      title: { type: "STRING", description: "Meeting title" },
+      date_time: { type: "STRING", description: "Start time, ISO 8601 with timezone offset." },
+      guest_email: { type: "STRING", description: "Guest email. Ask the user to spell it out and read it back before booking." } },
+      required: ["title", "date_time"] } }
+]}];
+
+const ENDPOINTS = { check_availability: "/api/check_availability", book_meeting: "/api/book_meeting" };
+
+$("connectBtn").onclick = () => {
+  const key = $("apiKey").value.trim();
+  if (!key) return alert("Enter your Gemini API key.");
+  $("connectBtn").disabled = true;
+  setStatus("Connecting...", "busy");
+
+  ws = new WebSocket(`${WS_BASE}?key=${encodeURIComponent(key)}`);
+
+  ws.onopen = () => {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    ws.send(JSON.stringify({ setup: {
+      model: MODEL,
+      generationConfig: { responseModalities: ["AUDIO"],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } } },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      systemInstruction: { parts: [{ text:
+        `You are a friendly scheduling assistant on a voice call. Keep replies short.\n` +
+        `Current local time: ${localISO()} (timezone ${tz}). Resolve words like "tomorrow" from this.\n` +
+        `Always call check_availability before book_meeting. Confirm the time (and email if given) with the user, then book.\n` +
+        `Send every date as ISO 8601 including the timezone offset.` }] },
+      tools: TOOLS
+    }}));
+  };
+
+  ws.onmessage = async (ev) => {
+    const raw = typeof ev.data === "string" ? ev.data : await ev.data.text();
+    const msg = JSON.parse(raw);
+
+    if (msg.setupComplete) {
+      ready = true; $("mic").disabled = false;
+      setStatus("Ready", "ok"); add("Connected. Tap the mic and talk.", "sys");
+    }
+    if (msg.toolCall) handleToolCalls(msg.toolCall.functionCalls || []);
+    if (msg.serverContent) handleContent(msg.serverContent);
+  };
+
+  ws.onerror = () => add("Connection error.", "sys");
+  ws.onclose = (e) => {
+    ready = false; $("mic").disabled = true; $("connectBtn").disabled = false;
+    stopCall(); setStatus("Disconnected");
+    add(`Connection closed (${e.code}) ${e.reason || "Check your API key and model name."}`, "sys");
+  };
+};
+
+async function handleToolCalls(calls) {
+  const out = [];
+  for (const c of calls) {
+    addTool(`${c.name}(${JSON.stringify(c.args)})`);
+    const path = ENDPOINTS[c.name];
+    let output = "Unknown tool.";
+    if (path) {
+      try {
+        const r = await fetch(path, { method: "POST",
+          headers: { "Content-Type": "application/json", "X-API-Token": API_TOKEN },
+          body: JSON.stringify(c.args || {}) });
+        output = r.ok ? (await r.json()).result : `Server refused the request (${r.status}).`;
+      } catch { output = "Could not reach the local server."; }
+    }
+    out.push({ id: c.id, name: c.name, response: { output } });
+  }
+  ws.send(JSON.stringify({ toolResponse: { functionResponses: out } }));
+}
+
+function handleContent(c) {
+  if (c.interrupted) {
+    sources.forEach(s => { try { s.stop(); } catch {} }); sources = [];
+    nextTime = ctx ? ctx.currentTime : 0; speaking(false); bubble = null;
+  }
+  if (c.inputTranscription?.text) add(c.inputTranscription.text, "you", true);
+  if (c.outputTranscription?.text) { speaking(true); add(c.outputTranscription.text, "ai", true); }
+  for (const part of c.modelTurn?.parts || []) if (part.inlineData) play(part.inlineData.data);
+  if (c.turnComplete) { speaking(false); bubble = null; }
+}
+
+function speaking(on) {
+  $("orb").classList.toggle("speaking", on);
+  if (calling) setStatus(on ? "Assistant speaking..." : "Listening...", on ? "busy" : "ok");
+}
+
+function play(b64) {
+  if (!ctx) return;
+  const bin = atob(b64), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const pcm = new Int16Array(bytes.buffer);
+  const buf = ctx.createBuffer(1, pcm.length, 24000);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  const src = ctx.createBufferSource(); src.buffer = buf;
+  src.connect(aiAn); aiAn.connect(ctx.destination);
+  const t = Math.max(ctx.currentTime, nextTime); src.start(t); nextTime = t + buf.duration;
+  sources.push(src); src.onended = () => { sources = sources.filter(s => s !== src); };
+}
+
+function toBase64PCM(f32) {
+  const view = new DataView(new ArrayBuffer(f32.length * 2));
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  let bin = ""; const u8 = new Uint8Array(view.buffer);
+  for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+  return btoa(bin);
+}
+
+$("mic").onclick = async () => { calling ? stopCall() : await startCall(); };
+
+async function startCall() {
+  if (!ready) return;
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    nextTime = ctx.currentTime;
+    micAn = ctx.createAnalyser(); aiAn = ctx.createAnalyser();
+    micAn.fftSize = aiAn.fftSize = 256;
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    const src = ctx.createMediaStreamSource(stream);
+    src.connect(micAn);
+    proc = ctx.createScriptProcessor(2048, 1, 1);
+    proc.onaudioprocess = e => {
+      if (ws?.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify({ realtimeInput: { audio: { mimeType: "audio/pcm;rate=16000", data: toBase64PCM(e.inputBuffer.getChannelData(0)) } } }));
+    };
+    src.connect(proc); proc.connect(ctx.destination);
+    calling = true; $("mic").classList.add("on"); $("mic").textContent = "⏹️";
+    setStatus("Listening...", "ok"); add("Microphone on.", "sys"); animate();
+  } catch (err) {
+    add("Could not access the microphone: " + err.message, "sys"); stopCall();
+  }
+}
+
+function stopCall() {
+  calling = false; cancelAnimationFrame(raf);
+  $("mic").classList.remove("on"); $("mic").textContent = "🎙️";
+  $("orb").classList.remove("speaking");
+  $("mic").style.setProperty("--mic", 1); $("orb").style.setProperty("--ai", 1);
+  try { proc?.disconnect(); } catch {}
+  stream?.getTracks().forEach(t => t.stop());
+  sources.forEach(s => { try { s.stop(); } catch {} }); sources = [];
+  if (ctx && ctx.state !== "closed") ctx.close();
+  ctx = proc = stream = null;
+  if (ready) setStatus("Ready", "ok");
+}
+
+function animate() {
+  const m = new Uint8Array(micAn.frequencyBinCount), a = new Uint8Array(aiAn.frequencyBinCount);
+  const avg = arr => arr.reduce((x, y) => x + y, 0) / arr.length / 255;
+  (function loop() {
+    if (!calling) return;
+    micAn.getByteFrequencyData(m); aiAn.getByteFrequencyData(a);
+    $("mic").style.setProperty("--mic", 1 + avg(m) * 0.15);
+    $("orb").style.setProperty("--ai", 1 + avg(a) * 0.8);
+    raf = requestAnimationFrame(loop);
+  })();
+}
+</script>
+</body>
+</html>
